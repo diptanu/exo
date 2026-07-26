@@ -166,6 +166,20 @@ impl SandboxBackendRegistration {
         })
     }
 
+    pub fn tensorlake(spec: TensorlakeBackendSpec) -> Self {
+        Self::from_factory(SandboxProvider::Tensorlake, move |inner| {
+            let spec = spec.clone();
+            Box::pin(async move {
+                let config = match inner.tensorlake_config_from_binding().await? {
+                    Some(config) => config,
+                    None => inner.tensorlake_config_from_spec(&spec).await?,
+                };
+                Ok(Arc::new(crate::TensorlakeSandboxBackend::new(config)?)
+                    as Arc<dyn ManagedSandboxBackend>)
+            })
+        })
+    }
+
     pub fn vercel(spec: VercelBackendSpec) -> Self {
         Self::from_factory(SandboxProvider::Vercel, move |inner| {
             let spec = spec.clone();
@@ -297,6 +311,29 @@ impl Default for SpritesBackendSpec {
             url_auth: None,
             organization: None,
             labels: Vec::new(),
+        }
+    }
+}
+
+/// Tensorlake connection config plus the secret-store name for the API key,
+/// resolved lazily on first use.
+#[derive(Debug, Clone)]
+pub struct TensorlakeBackendSpec {
+    pub api_url: String,
+    pub api_key_secret: String,
+    pub default_image: String,
+    pub cpus: Option<u32>,
+    pub memory_mb: Option<u64>,
+}
+
+impl Default for TensorlakeBackendSpec {
+    fn default() -> Self {
+        Self {
+            api_url: crate::DEFAULT_TENSORLAKE_API_URL.to_string(),
+            api_key_secret: "TENSORLAKE_API_KEY".to_string(),
+            default_image: crate::default_tensorlake_image(),
+            cpus: None,
+            memory_mb: None,
         }
     }
 }
@@ -519,6 +556,69 @@ impl BasicExoHarnessInner {
             url_auth,
             organization,
             extra_labels: labels,
+        }))
+    }
+
+    async fn tensorlake_config_from_spec(
+        &self,
+        spec: &TensorlakeBackendSpec,
+    ) -> Result<crate::TensorlakeConfig> {
+        let api_key = self
+            .secret_key(&spec.api_key_secret)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "tensorlake sandbox requested but secret {:?} is not set",
+                    spec.api_key_secret
+                )
+            })?;
+        Ok(crate::TensorlakeConfig {
+            api_key,
+            api_url: spec.api_url.clone(),
+            default_image: spec.default_image.clone(),
+            cpus: spec.cpus.map(f64::from),
+            memory_mb: spec.memory_mb,
+            sandbox_base_url: None,
+        })
+    }
+
+    async fn tensorlake_config_from_binding(&self) -> Result<Option<crate::TensorlakeConfig>> {
+        let bindings = list_binding_records(&self.storage, Path::new("bindings")).await?;
+        let Some((api_key_secret_id, api_url, default_image, cpus, memory_mb)) = bindings
+            .into_iter()
+            .rev()
+            .find_map(|record| match record.binding {
+                Binding::Sandbox {
+                    config:
+                        SandboxProviderConfig::Tensorlake {
+                            api_key_secret_id,
+                            api_url,
+                            default_image,
+                            cpus,
+                            memory_mb,
+                        },
+                    ..
+                } => Some((api_key_secret_id, api_url, default_image, cpus, memory_mb)),
+                _ => None,
+            })
+        else {
+            return Ok(None);
+        };
+        let api_key = self
+            .secret_key_by_id(api_key_secret_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "tensorlake sandbox binding references secret id {api_key_secret_id}, which is not set"
+                )
+            })?;
+        Ok(Some(crate::TensorlakeConfig {
+            api_key,
+            api_url: api_url.unwrap_or_else(|| crate::DEFAULT_TENSORLAKE_API_URL.to_string()),
+            default_image,
+            cpus: cpus.map(f64::from),
+            memory_mb,
+            sandbox_base_url: None,
         }))
     }
 
@@ -948,11 +1048,32 @@ impl ExoHarness for BasicExoHarness {
     }
 
     async fn delete_agent(&self, id: &AgentId) -> Result<bool> {
-        let _guard = self.inner.write_lock.lock().await;
         let agent_dir = self.agents_dir().join(id.to_string());
         if self.inner.storage.list_keys(&agent_dir).await?.is_empty() {
             return Ok(false);
         }
+        // Reclaim before taking `write_lock`. Termination is provider network
+        // I/O and mutates no storage, so holding the harness-wide write lock
+        // across it would stall every other writer for the round trips. The
+        // cost is a narrow race: a sandbox created for this agent between the
+        // sweep and the delete below is missed, which is the same orphan the
+        // sweep exists to prevent but far rarer than blocking all writes.
+        //
+        // The agent's own sandbox, plus one per conversation it owns — all of
+        // them lose their only handle when this agent's storage disappears.
+        terminate_owned_sandboxes(self, &agent_dir, SandboxOwner::Agent(*id)).await?;
+        for (conversation_dir, conversation_id) in
+            conversation_dirs_under_agent(self, &agent_dir).await?
+        {
+            terminate_owned_sandboxes(
+                self,
+                &conversation_dir,
+                SandboxOwner::Conversation(conversation_id),
+            )
+            .await?;
+        }
+
+        let _guard = self.inner.write_lock.lock().await;
         // Release the slug before the record (its source) disappears.
         if let Some(record) = self
             .inner
@@ -1237,7 +1358,6 @@ impl AgentHandle for BasicAgentHandle {
     }
 
     async fn delete_conversation(&self, id: &ConversationId) -> Result<bool> {
-        let _guard = self.harness.inner.write_lock.lock().await;
         let conversation_dir = self.conversations_dir().join(id.to_string());
         if self
             .harness
@@ -1249,6 +1369,15 @@ impl AgentHandle for BasicAgentHandle {
         {
             return Ok(false);
         }
+        // Outside `write_lock` on purpose — see `delete_agent`.
+        terminate_owned_sandboxes(
+            &self.harness,
+            &conversation_dir,
+            SandboxOwner::Conversation(*id),
+        )
+        .await?;
+
+        let _guard = self.harness.inner.write_lock.lock().await;
         if let Ok(mut record) = self
             .harness
             .inner
@@ -2775,6 +2904,110 @@ async fn start_sandbox_side_effect(
         sandbox_id: request.id,
         snapshot_id: Some(request.snapshot_id),
     })
+}
+
+/// Reclaim every sandbox recorded under `owner_dir`, ahead of that storage being
+/// deleted.
+///
+/// This has to run *before* `delete_prefix`: the stored records are the only
+/// thing that names these sandboxes, and a remote provider resolves them from
+/// the owner id baked into [`SandboxKey`]. Once the records are gone the
+/// sandboxes are unreachable — still billable, but impossible to address.
+///
+/// Best-effort per sandbox. A provider that errors is logged and skipped rather
+/// than failing the delete, because refusing to delete would leave the caller
+/// with a half-removed owner and no way to retry the reclamation either.
+async fn terminate_owned_sandboxes(
+    harness: &BasicExoHarness,
+    owner_dir: &Path,
+    owner: SandboxOwner,
+) -> Result<()> {
+    let sandboxes_dir = owner_dir.join("sandboxes");
+    for key in harness.inner.storage.list_keys(&sandboxes_dir).await? {
+        if !key.ends_with(".json") {
+            continue;
+        }
+        let stored: StoredSandbox = match harness.inner.storage.get_json(Path::new(&key)).await {
+            Ok(stored) => stored,
+            Err(error) => {
+                tracing::warn!(%key, %error, "skipping unreadable sandbox record during delete");
+                continue;
+            }
+        };
+
+        // Drop the live handle first so nothing in this process keeps using a
+        // sandbox we are about to reclaim, along with any process records that
+        // point at it — nothing can address them once the owner is gone.
+        harness
+            .inner
+            .running_sandboxes
+            .lock()
+            .await
+            .remove(&stored.id);
+        harness
+            .inner
+            .running_processes
+            .lock()
+            .await
+            .retain(|_, process| process.sandbox_id != stored.id);
+
+        let provider = stored.provider;
+        let sandbox_id = stored.id.clone();
+        let request = sandbox_request(owner, &sandbox_id, &stored, None);
+        let backend = match harness.inner.sandbox_backend_for_provider(provider).await {
+            Ok(backend) => backend,
+            Err(error) => {
+                tracing::warn!(
+                    %sandbox_id,
+                    %provider,
+                    %error,
+                    "cannot reach sandbox provider to terminate sandbox during delete"
+                );
+                continue;
+            }
+        };
+        if let Err(error) = backend.terminate(request).await {
+            tracing::warn!(
+                %sandbox_id,
+                %provider,
+                %error,
+                "failed to terminate sandbox during delete; it may be orphaned"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Every conversation directory under an agent, paired with its id.
+async fn conversation_dirs_under_agent(
+    harness: &BasicExoHarness,
+    agent_dir: &Path,
+) -> Result<Vec<(PathBuf, ConversationId)>> {
+    let conversations_dir = agent_dir.join("conversations");
+    let mut conversations = Vec::new();
+    for key in harness.inner.storage.list_keys(&conversations_dir).await? {
+        let path = Path::new(&key);
+        if !key.ends_with("/record.json") || path.components().count() != 5 {
+            continue;
+        }
+        // `agents/<agent>/conversations/<conversation>/record.json` — take the
+        // id from the path rather than the record. Reading the record would let
+        // a corrupt one silently skip reclaiming that conversation's sandboxes,
+        // which is exactly the orphan this sweep exists to prevent.
+        let Some(segment) = path
+            .components()
+            .nth(3)
+            .and_then(|component| component.as_os_str().to_str())
+        else {
+            continue;
+        };
+        let Ok(conversation_id) = segment.parse::<ConversationId>() else {
+            tracing::warn!(%key, "skipping conversation directory with an unparseable id");
+            continue;
+        };
+        conversations.push((conversations_dir.join(segment), conversation_id));
+    }
+    Ok(conversations)
 }
 
 async fn load_stored_sandbox(

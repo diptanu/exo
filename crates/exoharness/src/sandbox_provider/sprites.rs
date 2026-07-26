@@ -216,6 +216,17 @@ impl ManagedSandboxBackend for SpritesSandboxBackend {
             backend: self.handle_backend(),
         }))
     }
+
+    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        // Not implemented yet. Returning Ok would claim the sandbox was
+        // reclaimed, so warn instead: the caller has already discarded the
+        // record that names it, and nothing else will ever address it.
+        tracing::warn!(
+            key = %request.key,
+            "terminate is not implemented for the Sprites sandbox backend; the sandbox is left behind"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone)]

@@ -14,7 +14,7 @@ use lingua::universal::{AssistantContent, UserContent};
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::fs;
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use tokio::time::{sleep, timeout};
 
 use crate::test_support::{local_test_config, local_test_config_with_daytona};
@@ -1807,6 +1807,10 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("test provider-state backend does not support snapshot restore")
     }
+
+    async fn terminate(&self, _request: SandboxRequest) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 struct TestProviderStateHandle {
@@ -1869,6 +1873,10 @@ impl ManagedSandboxBackend for TestSandboxBackend {
         _payload: SnapshotPayload,
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("test sandbox backend does not support snapshot restore")
+    }
+
+    async fn terminate(&self, _request: SandboxRequest) -> crate::Result<()> {
+        Ok(())
     }
 }
 
@@ -2072,6 +2080,10 @@ impl ManagedSandboxBackend for RestoreImageTestBackend {
             image: "restored-image".to_string(),
         }))
     }
+
+    async fn terminate(&self, _request: SandboxRequest) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 struct RestoreImageTestHandle {
@@ -2156,4 +2168,255 @@ async fn daytona_sandbox_binding_drives_provider_config() {
     assert_eq!(config.target.as_deref(), Some("experimental"));
     assert_eq!(config.organization_id.as_deref(), Some("org-1"));
     assert_eq!(config.api_url, crate::DEFAULT_DAYTONA_API_URL);
+}
+
+/// Records the sandbox keys handed to `terminate`, so delete paths can be
+/// checked for actually reclaiming what they orphan.
+struct TerminateRecordingBackend {
+    terminated: Arc<AsyncMutex<Vec<String>>>,
+    /// When set, `terminate` signals the first and parks on the second, so a
+    /// test can observe what the rest of the harness can do mid-termination.
+    gate: Option<(Arc<Notify>, Arc<Notify>)>,
+}
+
+impl TerminateRecordingBackend {
+    fn new() -> (Self, Arc<AsyncMutex<Vec<String>>>) {
+        let terminated = Arc::new(AsyncMutex::new(Vec::new()));
+        (
+            Self {
+                terminated: Arc::clone(&terminated),
+                gate: None,
+            },
+            terminated,
+        )
+    }
+
+    fn with_gate() -> (Self, Arc<Notify>, Arc<Notify>) {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        (
+            Self {
+                terminated: Arc::new(AsyncMutex::new(Vec::new())),
+                gate: Some((Arc::clone(&entered), Arc::clone(&release))),
+            },
+            entered,
+            release,
+        )
+    }
+}
+
+#[async_trait]
+impl ManagedSandboxBackend for TerminateRecordingBackend {
+    async fn acquire(
+        &self,
+        _request: SandboxRequest,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        Ok(Arc::new(TerminateRecordingHandle))
+    }
+
+    async fn acquire_from_snapshot(
+        &self,
+        _request: SandboxRequest,
+        _payload: SnapshotPayload,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("terminate-recording backend does not support snapshot restore")
+    }
+
+    async fn terminate(&self, request: SandboxRequest) -> crate::Result<()> {
+        if let Some((entered, release)) = &self.gate {
+            entered.notify_one();
+            release.notified().await;
+        }
+        self.terminated.lock().await.push(request.key.to_string());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn delete_conversation_terminates_its_sandboxes() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let (backend, terminated) = TerminateRecordingBackend::new();
+    let harness = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        Arc::new(backend),
+    )
+    .await
+    .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let sandbox_id = test_sandbox(&conversation).await;
+    let conversation_id = conversation.record().id;
+
+    assert!(
+        agent
+            .delete_conversation(&conversation_id)
+            .await
+            .expect("delete conversation")
+    );
+
+    assert_eq!(
+        terminated.lock().await.as_slice(),
+        [format!("conversation:{conversation_id}:{sandbox_id}")]
+    );
+}
+
+/// The agent's own sandbox lives under the agent directory, not a conversation,
+/// so it needs its own sweep — `delete_agent` reclaims both scopes.
+#[tokio::test]
+async fn delete_agent_terminates_its_agent_scoped_sandbox() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let (backend, terminated) = TerminateRecordingBackend::new();
+    let harness = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        Arc::new(backend),
+    )
+    .await
+    .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let agent_id = agent.record().id;
+    let sandbox_id = agent
+        .create_sandbox(CreateSandboxRequest {
+            name: None,
+            provider: SandboxProvider::LocalProcess,
+            image: "test-sandbox".to_string(),
+            default_workdir: Some("/".to_string()),
+            file_system_mounts: None,
+            durable_file_systems: None,
+            enable_networking: Some(true),
+            idle_seconds: Some(60),
+        })
+        .await
+        .expect("agent sandbox should be created");
+
+    assert!(harness.delete_agent(&agent_id).await.expect("delete agent"));
+
+    assert_eq!(
+        terminated.lock().await.as_slice(),
+        [format!("agent:{agent_id}:{sandbox_id}")]
+    );
+}
+
+/// Deleting an agent removes its conversations' storage too, so their sandboxes
+/// have to be reclaimed in the same sweep — nothing else will ever name them.
+#[tokio::test]
+async fn delete_agent_terminates_sandboxes_of_its_conversations() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let (backend, terminated) = TerminateRecordingBackend::new();
+    let harness = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        Arc::new(backend),
+    )
+    .await
+    .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let sandbox_id = test_sandbox(&conversation).await;
+    let conversation_id = conversation.record().id;
+    let agent_id = agent.record().id;
+
+    assert!(harness.delete_agent(&agent_id).await.expect("delete agent"));
+
+    assert_eq!(
+        terminated.lock().await.as_slice(),
+        [format!("conversation:{conversation_id}:{sandbox_id}")]
+    );
+}
+
+struct TerminateRecordingHandle;
+
+#[async_trait]
+impl ManagedSandboxHandle for TerminateRecordingHandle {
+    fn id(&self) -> &str {
+        "terminate-recording-sandbox"
+    }
+
+    async fn exec(&self, _command: &SandboxCommand) -> crate::Result<SandboxCommandOutput> {
+        bail!("terminate-recording handle does not support exec")
+    }
+
+    async fn start_process(&self, _command: &SandboxCommand) -> crate::Result<SandboxProcessParts> {
+        bail!("terminate-recording handle does not support start_process")
+    }
+
+    async fn stop(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    async fn snapshot(&self) -> crate::Result<SnapshotPayload> {
+        bail!("terminate-recording handle does not support snapshots")
+    }
+}
+
+/// Termination is provider network I/O, so it must happen outside the
+/// harness-wide write lock. Parked inside `terminate`, an unrelated write has to
+/// keep working; if the lock were held across it, this would deadlock.
+#[tokio::test]
+async fn delete_terminates_sandboxes_without_holding_the_write_lock() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let (backend, entered, release) = TerminateRecordingBackend::with_gate();
+    let harness = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        Arc::new(backend),
+    )
+    .await
+    .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    test_sandbox(&conversation).await;
+    let conversation_id = conversation.record().id;
+
+    let deleting = tokio::spawn(async move { agent.delete_conversation(&conversation_id).await });
+
+    entered.notified().await;
+    timeout(
+        Duration::from_secs(5),
+        harness.new_agent(NewAgentRequest {
+            slug: "other".to_string(),
+            name: "Other".to_string(),
+        }),
+    )
+    .await
+    .expect("a concurrent write must not block behind sandbox termination")
+    .expect("second agent");
+    release.notify_one();
+
+    assert!(
+        deleting
+            .await
+            .expect("delete task should join")
+            .expect("delete conversation")
+    );
 }

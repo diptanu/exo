@@ -138,6 +138,9 @@ pub enum SnapshotKind {
     /// Reference to a Sprites checkpoint id on a named sprite. Payload bytes are
     /// a small JSON manifest; restoring is `POST .../checkpoints/{id}/restore`.
     SpritesSnapshot,
+    /// Reference to a Tensorlake platform snapshot id. Payload bytes are a small
+    /// JSON manifest; restoring is `POST /sandboxes { snapshot_id: <id> }`.
+    TensorlakeSnapshot,
 }
 
 #[async_trait]
@@ -181,6 +184,24 @@ pub trait ManagedSandboxBackend: Send + Sync {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>>;
+
+    /// Destroy the sandbox this request maps to, reclaiming whatever the
+    /// provider is holding for it.
+    ///
+    /// This is the counterpart to [`ManagedSandboxHandle::stop`], not a synonym.
+    /// `stop` *parks* a sandbox — remote backends pause, suspend, or hibernate so
+    /// the next `acquire` for the same key resumes the same filesystem. `terminate`
+    /// gives it up for good, and is what the harness calls when the owning agent or
+    /// conversation is deleted and no future `acquire` can ever name it again.
+    ///
+    /// Takes a request rather than a handle because deletion has to work for a
+    /// sandbox this process never acquired: implementations resolve it the same
+    /// way `acquire` does (deterministic name, labels, metadata) instead of
+    /// relying on live in-process state.
+    ///
+    /// Idempotent — succeeds when there is nothing to reclaim, and must never
+    /// create a sandbox as a side effect of looking for one.
+    async fn terminate(&self, request: SandboxRequest) -> Result<()>;
 }
 
 pub const DEFAULT_SANDBOX_IMAGE: &str = crate::sandbox_provider::DEFAULT_DOCKER_IMAGE;
@@ -543,6 +564,10 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
                 "SpritesSnapshot payloads can only be restored by the Sprites sandbox provider; \
                  select provider sprites to rewind this snapshot"
             ),
+            (_, SnapshotKind::TensorlakeSnapshot) => bail!(
+                "TensorlakeSnapshot payloads can only be restored by the Tensorlake sandbox \
+                 provider; select provider tensorlake to rewind this snapshot"
+            ),
         }
 
         let image_tag = docker_load_image(&self.container_bin, &payload.bytes).await?;
@@ -585,6 +610,17 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
             request,
             warm_sandboxes: Arc::clone(&self.warm_sandboxes),
         }))
+    }
+
+    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        // Not implemented yet. Returning Ok would claim the sandbox was
+        // reclaimed, so warn instead: the caller has already discarded the
+        // record that names it, and nothing else will ever address it.
+        tracing::warn!(
+            key = %request.key,
+            "terminate is not implemented for the container CLI sandbox backend; the sandbox is left behind"
+        );
+        Ok(())
     }
 }
 
@@ -745,6 +781,11 @@ impl ManagedSandboxBackend for LocalProcessSandboxBackend {
         _payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("restore-from-snapshot is not supported by the local-process sandbox backend")
+    }
+
+    async fn terminate(&self, _request: SandboxRequest) -> Result<()> {
+        // Commands run directly on the host; there is no sandbox to reclaim.
+        Ok(())
     }
 }
 

@@ -289,7 +289,9 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
             SnapshotKind::DockerImageTar => {
                 import_docker_image_tar(&self.handle_backend(), &payload.bytes).await?
             }
-            SnapshotKind::E2bSnapshot | SnapshotKind::SpritesSnapshot => bail!(
+            SnapshotKind::E2bSnapshot
+            | SnapshotKind::SpritesSnapshot
+            | SnapshotKind::TensorlakeSnapshot => bail!(
                 "the Daytona backend cannot restore a {:?} payload; \
                  select the provider that produced the snapshot",
                 payload.kind
@@ -306,6 +308,17 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
             request,
             backend: self.handle_backend(),
         }))
+    }
+
+    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        // Not implemented yet. Returning Ok would claim the sandbox was
+        // reclaimed, so warn instead: the caller has already discarded the
+        // record that names it, and nothing else will ever address it.
+        tracing::warn!(
+            key = %request.key,
+            "terminate is not implemented for the Daytona sandbox backend; the sandbox is left behind"
+        );
+        Ok(())
     }
 }
 

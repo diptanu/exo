@@ -31,11 +31,11 @@ use executor::{
     ForkConversationRequest, HTTP_EXOHARNESS_TRACING_TARGET, Harness, HarnessAgent,
     HarnessConversation, HttpExoHarness, LocalSandboxExoHarness, PutSecretRequest, RlmHarness,
     SANDBOX_MAIN_MOUNT_DIR, SandboxBackendRegistration, SandboxProvider, SandboxProviderConfig,
-    SandboxScope, Secret, SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime,
-    TypeScriptHarness, TypeScriptHarnessConfig, Uuid7, VercelBackendSpec,
+    SandboxScope, Secret, SecretBackendChoice, SpritesBackendSpec, TensorlakeBackendSpec,
+    ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig, Uuid7, VercelBackendSpec,
     default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
-    default_vercel_image, effective_sandbox_scope, load_agent_config, send_conversation_wakeup,
-    serve_exoharness_http_listener_with_options,
+    default_tensorlake_image, default_vercel_image, effective_sandbox_scope, load_agent_config,
+    send_conversation_wakeup, serve_exoharness_http_listener_with_options,
 };
 use lingua::Message;
 use lingua::universal::{AssistantContent, AssistantContentPart, ToolContentPart, UserContent};
@@ -218,6 +218,7 @@ enum SandboxProviderArg {
     E2b,
     #[value(name = "sprites")]
     Sprites,
+    Tensorlake,
     Vercel,
     #[value(name = "aws-agentcore")]
     AwsAgentCore,
@@ -234,6 +235,7 @@ impl From<SandboxProviderArg> for SandboxProvider {
             SandboxProviderArg::Daytona => Self::Daytona,
             SandboxProviderArg::E2b => Self::E2b,
             SandboxProviderArg::Sprites => Self::Sprites,
+            SandboxProviderArg::Tensorlake => Self::Tensorlake,
             SandboxProviderArg::Vercel => Self::Vercel,
             SandboxProviderArg::AwsAgentCore => Self::AwsAgentCore,
             SandboxProviderArg::AppleContainer => Self::AppleContainer,
@@ -298,6 +300,7 @@ fn default_sandbox_backends() -> Vec<SandboxBackendRegistration> {
         SandboxBackendRegistration::daytona(DaytonaBackendSpec::default()),
         SandboxBackendRegistration::e2b(E2bBackendSpec::default()),
         SandboxBackendRegistration::sprites(SpritesBackendSpec::default()),
+        SandboxBackendRegistration::tensorlake(TensorlakeBackendSpec::default()),
         SandboxBackendRegistration::vercel(VercelBackendSpec::with_conventional_secrets()),
         SandboxBackendRegistration::aws_agentcore(),
     ]
@@ -694,6 +697,12 @@ struct ProviderConfigureArgs {
     /// Extra Sprites labels (repeatable). Exo resume labels are added on create.
     #[arg(long = "label")]
     labels: Vec<String>,
+    /// Tensorlake: whole CPU cores per sandbox.
+    #[arg(long)]
+    cpus: Option<u32>,
+    /// Tensorlake: memory per sandbox in MiB.
+    #[arg(long = "memory-mb")]
+    memory_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Args)]
@@ -1942,6 +1951,8 @@ async fn main() -> Result<()> {
                     default_image,
                     url_auth,
                     labels,
+                    cpus,
+                    memory_mb,
                 } = *args;
                 let binding_name =
                     name.unwrap_or_else(|| SandboxProvider::from(provider).as_str().to_string());
@@ -2036,6 +2047,21 @@ async fn main() -> Result<()> {
                             url_auth,
                             organization: organization_id,
                             labels,
+                        }
+                    }
+                    SandboxProviderArg::Tensorlake => {
+                        let secret =
+                            secret.ok_or_else(|| anyhow!("--secret is required for tensorlake"))?;
+                        let secret_id =
+                            find_secret_id(harness.exoharness_handle().as_ref(), &secret)
+                                .await?
+                                .ok_or_else(|| anyhow!("secret not found: {secret}"))?;
+                        SandboxProviderConfig::Tensorlake {
+                            api_key_secret_id: secret_id,
+                            api_url,
+                            default_image: default_image.unwrap_or_else(default_tensorlake_image),
+                            cpus,
+                            memory_mb,
                         }
                     }
                     other => bail!("provider {other:?} has no binding-based config yet"),
